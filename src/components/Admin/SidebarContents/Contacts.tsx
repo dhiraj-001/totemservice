@@ -1,5 +1,10 @@
 import React, { useState, useEffect } from 'react';
-import { Pencil, Trash2, Plus, X, Phone, Mail, Calendar, User, MessageSquare, ChevronRight, MessageCircle } from 'lucide-react';
+import { Phone, Mail, Calendar, User, MessageSquare, RefreshCw } from 'lucide-react';
+
+// Google Sheets API configuration
+const GOOGLE_SHEETS_API_KEY = 'AIzaSyBD8ieWMpe7CgM2Nn5CjwSsF2fbVdAsSTk';
+const SPREADSHEET_ID = '1gVKtmXIFtsiiaV2XAlUSSAHgpMQ0_jQqxzvs_Z8BQRo';
+const SHEET_NAME = 'Sheet1'; // You can change this to your specific sheet name
 
 interface ChatMessage {
   role: 'bot' | 'user';
@@ -29,31 +34,136 @@ interface Contact {
   updatedAt?: string;
 }
 
-interface NewContact {
-  name: string;
-  email: string;
-  phone: string;
-  message: string;
-  source: string;
-  status: 'new' | 'contacted' | 'qualified' | 'converted' | 'lost';
-}
+
+// Google Sheets data interface
 
 const Contacts: React.FC = () => {
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [isLoading, setIsLoading] = useState(true);
-  const [isModalOpen, setIsModalOpen] = useState<boolean>(false);
-  const [editingContact, setEditingContact] = useState<Contact | null>(null);
   const [filterStatus, setFilterStatus] = useState<string>('all');
   const [searchTerm, setSearchTerm] = useState<string>('');
-  const [expandedContacts, setExpandedContacts] = useState<Set<string>>(new Set());
-  const [newContact, setNewContact] = useState<NewContact>({
-    name: "",
-    email: "",
-    phone: "",
-    message: "",
-    source: "manual",
-    status: "new"
-  });
+  const [dataSource, setDataSource] = useState<'sheets' | 'api'>('api');
+
+  // Function to fetch data from Google Sheets
+  const fetchFromGoogleSheets = async (): Promise<Contact[]> => {
+    try {
+      const range = `${SHEET_NAME}!A:G`; // Assuming columns A-G contain the data
+      const url = `https://sheets.googleapis.com/v4/spreadsheets/${SPREADSHEET_ID}/values/${range}?key=${GOOGLE_SHEETS_API_KEY}`;
+      
+      const response = await fetch(url);
+      
+      if (!response.ok) {
+        throw new Error(`Failed to fetch from Google Sheets: ${response.status}`);
+      }
+      
+      const data = await response.json();
+      
+      if (!data.values || data.values.length === 0) {
+        console.log('No data found in Google Sheets');
+        return [];
+      }
+      
+      // Skip the header row and process data
+      const rows = data.values.slice(1);
+      
+      return rows.map((row: any[], index: number) => {
+        // Handle different column arrangements - try to map columns intelligently
+        const [name, email, phone, conversationData, source, timestamp] = row;
+        
+        // Parse timestamp if it exists
+        let parsedTimestamp = new Date().toISOString();
+        if (timestamp) {
+          try {
+            // Try to parse various date formats
+            const date = new Date(timestamp);
+            if (!isNaN(date.getTime())) {
+              parsedTimestamp = date.toISOString();
+            }
+          } catch (e) {
+            console.warn('Could not parse timestamp:', timestamp);
+          }
+        }
+        
+        // Parse conversation data - handle both JSON string and array formats
+        let messages: ChatMessage[] = [];
+        if (conversationData) {
+          try {
+            // Try to parse as JSON string first
+            if (typeof conversationData === 'string' && conversationData.trim().startsWith('[')) {
+              const parsedMessages = JSON.parse(conversationData);
+              messages = parsedMessages.filter((msg: any) => msg && msg.role && msg.content).map((msg: any) => ({
+                role: msg.role as 'bot' | 'user',
+                content: msg.content,
+                timestamp: msg.timestamp || parsedTimestamp
+              }));
+            } else if (typeof conversationData === 'string' && conversationData.trim().startsWith('{')) {
+              // Single message object
+              const parsedMessage = JSON.parse(conversationData);
+              if (parsedMessage && parsedMessage.role && parsedMessage.content) {
+                messages = [{
+                  role: parsedMessage.role as 'bot' | 'user',
+                  content: parsedMessage.content,
+                  timestamp: parsedMessage.timestamp || parsedTimestamp
+                }];
+              }
+            } else {
+              // Fallback to simple message
+              messages = [
+                {
+                  role: 'user' as const,
+                  content: conversationData,
+                  timestamp: parsedTimestamp
+                }
+              ];
+            }
+          } catch (e) {
+            console.warn('Could not parse conversation data:', conversationData, e);
+            // Fallback to simple message
+            messages = [
+              {
+                role: 'user' as const,
+                content: conversationData || 'Contact from Google Sheets',
+                timestamp: parsedTimestamp
+              }
+            ];
+          }
+        } else {
+          // Default message if no conversation data
+          messages = [
+            {
+              role: 'user' as const,
+              content: 'Contact from Google Sheets',
+              timestamp: parsedTimestamp
+            }
+          ];
+        }
+        
+        return {
+          id: `sheet-${index + 1}`,
+          chatbotId: `sheet-chatbot-${index + 1}`,
+          userId: index + 1,
+          name: name || 'Unknown',
+          phone: phone || '',
+          email: email || '',
+          consentGiven: true, // Default to true for sheet data
+          conversationContext: {
+            messages: messages,
+            variables: {
+              page: source || 'Google Sheets',
+              referrer: 'Google Sheets Import',
+              userAgent: 'Google Sheets API'
+            }
+          },
+          createdAt: parsedTimestamp,
+          updatedAt: parsedTimestamp
+        };
+      }).filter((contact: Contact) => contact.name !== 'Unknown' || contact.email || contact.phone); // Filter out completely empty rows
+      
+    } catch (error) {
+      console.error('Error fetching from Google Sheets:', error);
+      throw error;
+    }
+  };
 
   useEffect(() => {
     fetchContacts();
@@ -61,6 +171,21 @@ const Contacts: React.FC = () => {
 
   const fetchContacts = async () => {
     try {
+      setIsLoading(true);
+      
+      // First try to fetch from Google Sheets
+      try {
+        const sheetContacts = await fetchFromGoogleSheets();
+        if (sheetContacts.length > 0) {
+          setContacts(sheetContacts);
+          setDataSource('sheets');
+          return;
+        }
+      } catch (sheetError) {
+        console.warn('Failed to fetch from Google Sheets, falling back to API:', sheetError);
+      }
+
+      // Fallback to existing API
       const token = localStorage.getItem("token");
       if (!token) {
         alert("Authentication token is missing. Please log in again.");
@@ -82,244 +207,18 @@ const Contacts: React.FC = () => {
 
       const data = await response.json();
       setContacts(data);
+      setDataSource('api');
     } catch (error) {
       console.error("Error fetching contacts:", error);
-      // For demo purposes, create some mock data based on the webhook format
-      const mockContacts: Contact[] = [
-        {
-          id: "1",
-          chatbotId: "dcc9c0b0-7307-4e33-9552-263b3c49e605",
-          userId: 1,
-          name: "Dhiraj",
-          phone: "80980",
-          email: "",
-          consentGiven: true,
-          conversationContext: {
-            messages: [
-              {
-                role: "bot",
-                content: "Hello. Welcome to **Totem Management and Consultancy**. We are here to provide **complete digital solutions** for brands and individuals. Feel free to explore the options below to get started",
-                timestamp: "2025-08-01T10:42:48.335Z"
-              },
-              {
-                role: "user",
-                content: "contact",
-                timestamp: "2025-08-01T10:42:55.112Z"
-              },
-              {
-                role: "bot",
-                content: "I understand your question. Let me help you with that.\n\n📞 **Stay connected:** Leave your contact info below!",
-                timestamp: "2025-08-01T10:43:00.497Z"
-              }
-            ],
-            variables: {
-              page: "http://localhost:5173/appearance",
-              referrer: "http://localhost:5173/chatbots",
-              userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
-            }
-          },
-          createdAt: "2025-08-01T10:43:07.986Z"
-        },
-        {
-          id: "2",
-          chatbotId: "dcc9c0b0-7307-4e33-9552-263b3c49e606",
-          userId: 2,
-          name: "John Doe",
-          phone: "+1234567890",
-          email: "john@example.com",
-          consentGiven: true,
-          conversationContext: {
-            messages: [
-              {
-                role: "bot",
-                content: "Hello! How can I help you today?",
-                timestamp: "2025-08-01T09:30:00.000Z"
-              },
-              {
-                role: "user",
-                content: "I need help with digital marketing",
-                timestamp: "2025-08-01T09:30:30.000Z"
-              }
-            ],
-            variables: {
-              page: "http://localhost:5173/services",
-              referrer: "http://localhost:5173/",
-              userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            }
-          },
-          createdAt: "2025-08-01T09:31:00.000Z"
-        }
-      ];
-      setContacts(mockContacts);
+       // No demo data - just show empty state
+       setContacts([]);
+       setDataSource('api');
     } finally {
       setIsLoading(false);
     }
   };
 
-  const handleDelete = async (id: string) => {
-    if (!confirm("Are you sure you want to delete this contact?")) {
-      return;
-    }
 
-    try {
-      const token = localStorage.getItem("token");
-      if (!token) {
-        alert("Authentication token is missing. Please log in again.");
-        return;
-      }
-
-      const response = await fetch(
-        `https://totem-consultancy-alpha.vercel.app/api/contacts/${id}`,
-        {
-          method: "DELETE",
-          headers: {
-            Authorization: `Bearer ${token}`,
-          },
-        }
-      );
-
-      if (!response.ok) {
-        throw new Error("Failed to delete contact");
-      }
-
-      setContacts(contacts.filter(contact => contact.id !== id));
-      alert("Contact deleted successfully!");
-    } catch (error) {
-      console.error("Error deleting contact:", error);
-      // For demo purposes, remove from local state
-      setContacts(contacts.filter(contact => contact.id !== id));
-      alert("Contact deleted successfully!");
-    }
-  };
-
-  const handleEdit = (contact: Contact): void => {
-    setEditingContact(contact);
-    setNewContact({
-      name: contact.name,
-      email: contact.email,
-      phone: contact.phone,
-      message: contact.conversationContext.messages[contact.conversationContext.messages.length - 1]?.content || "",
-      source: "webhook",
-      status: "new"
-    });
-    setIsModalOpen(true);
-  };
-
-  const handleAdd = (): void => {
-    setEditingContact(null);
-    setNewContact({
-      name: "",
-      email: "",
-      phone: "",
-      message: "",
-      source: "manual",
-      status: "new"
-    });
-    setIsModalOpen(true);
-  };
-
-  const handleSave = async () => {
-    if (!newContact.name) {
-      alert("Name is required!");
-      return;
-    }
-
-    try {
-      const token = localStorage.getItem("token");
-      if (!token) {
-        alert("Authentication token is missing. Please log in again.");
-        return;
-      }
-
-      const url = editingContact
-        ? `https://totem-consultancy-alpha.vercel.app/api/contacts/${editingContact.id}`
-        : "https://totem-consultancy-alpha.vercel.app/api/contacts";
-
-      const method = editingContact ? "PUT" : "POST";
-
-      const response = await fetch(url, {
-        method,
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify(newContact),
-      });
-
-      if (!response.ok) {
-        throw new Error("Failed to save contact");
-      }
-
-      const savedContact = await response.json();
-
-      if (editingContact) {
-        setContacts(contacts.map(contact =>
-          contact.id === editingContact.id ? savedContact : contact
-        ));
-      } else {
-        setContacts([...contacts, savedContact]);
-      }
-
-      setIsModalOpen(false);
-      alert(editingContact ? "Contact updated successfully!" : "Contact added successfully!");
-    } catch (error) {
-      console.error("Error saving contact:", error);
-      // For demo purposes, add to local state
-      const demoContact: Contact = {
-        id: Date.now().toString(),
-        chatbotId: "demo-chatbot-id",
-        userId: contacts.length + 1,
-        name: newContact.name,
-        email: newContact.email,
-        phone: newContact.phone,
-        consentGiven: true,
-        conversationContext: {
-          messages: [
-            {
-              role: "user",
-              content: newContact.message,
-              timestamp: new Date().toISOString()
-            }
-          ],
-          variables: {
-            page: "manual-entry",
-            referrer: "admin-panel",
-            userAgent: "Admin Panel"
-          }
-        },
-        createdAt: new Date().toISOString()
-      };
-      
-      if (editingContact) {
-        setContacts(contacts.map(contact =>
-          contact.id === editingContact.id ? demoContact : contact
-        ));
-      } else {
-        setContacts([...contacts, demoContact]);
-      }
-      
-      setIsModalOpen(false);
-      alert(editingContact ? "Contact updated successfully!" : "Contact added successfully!");
-    }
-  };
-
-  const handleInputChange = (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>) => {
-    const { name, value } = e.target;
-    setNewContact(prev => ({
-      ...prev,
-      [name]: value
-    }));
-  };
-
-  const toggleExpanded = (contactId: string) => {
-    const newExpanded = new Set(expandedContacts);
-    if (newExpanded.has(contactId)) {
-      newExpanded.delete(contactId);
-    } else {
-      newExpanded.add(contactId);
-    }
-    setExpandedContacts(newExpanded);
-  };
 
 
   const formatDate = (dateString: string) => {
@@ -332,12 +231,7 @@ const Contacts: React.FC = () => {
     });
   };
 
-  const formatMessageTime = (timestamp: string) => {
-    return new Date(timestamp).toLocaleTimeString('en-US', {
-      hour: '2-digit',
-      minute: '2-digit'
-    });
-  };
+
 
   const filteredContacts = contacts.filter(contact => {
     const matchesStatus = filterStatus === 'all';
@@ -364,14 +258,27 @@ const Contacts: React.FC = () => {
           <p className="mt-1 text-sm text-gray-600 dark:text-gray-400">
             Manage leads from chatbot conversations and webhooks
           </p>
+          <div className="mt-2 flex items-center space-x-2">
+            <span className="text-xs text-gray-500 dark:text-gray-400">Data Source:</span>
+                         <span className={`inline-flex px-2 py-1 text-xs font-semibold rounded-full ${
+               dataSource === 'sheets' 
+                 ? 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200' 
+                 : 'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200'
+             }`}>
+               {dataSource === 'sheets' ? 'Google Sheets' : 'API'}
+             </span>
+          </div>
         </div>
+                 <div className="mt-4 sm:mt-0">
         <button
-          onClick={handleAdd}
-          className="mt-4 sm:mt-0 inline-flex items-center px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
+             onClick={fetchContacts}
+             disabled={isLoading}
+             className="inline-flex items-center px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 transition-colors disabled:opacity-50"
         >
-          <Plus size={20} className="mr-2" />
-          Add Contact
+             <RefreshCw size={20} className={`mr-2 ${isLoading ? 'animate-spin' : ''}`} />
+             Refresh
         </button>
+         </div>
       </div>
 
       {/* Filters */}
@@ -410,7 +317,16 @@ const Contacts: React.FC = () => {
             <thead className="bg-gray-50 dark:bg-gray-700">
               <tr>
                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
-                  Contact
+              
+                </th>
+                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                   Name
+                 </th>
+                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                   Email
+                 </th>
+                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                   Phone
                 </th>
                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
                   Source
@@ -421,9 +337,6 @@ const Contacts: React.FC = () => {
                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
                   Date
                 </th>
-                <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
-                  Actions
-                </th>
               </tr>
             </thead>
             <tbody className="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
@@ -432,30 +345,41 @@ const Contacts: React.FC = () => {
                   <tr className="hover:bg-gray-50 dark:hover:bg-gray-700">
                     <td className="px-6 py-4 whitespace-nowrap">
                       <div className="flex items-center">
-                        <div className="flex-shrink-0 h-10 w-10">
-                          <div className="h-10 w-10 rounded-full bg-blue-100 dark:bg-blue-900 flex items-center justify-center">
-                            <User size={20} className="text-blue-600 dark:text-blue-400" />
+                        <div className="flex-shrink-0 h-8 w-8">
+                          <div className="h-8 w-8 rounded-full bg-blue-100 dark:bg-blue-900 flex items-center justify-center">
+                            <User size={16} className="text-blue-600 dark:text-blue-400" />
                           </div>
                         </div>
-                        <div className="ml-4">
-                          <div className="text-sm font-medium text-gray-900 dark:text-white">
-                            {contact.name}
-                          </div>
-                          <div className="text-sm text-gray-500 dark:text-gray-400">
-                            {contact.email && (
-                              <div className="flex items-center">
-                                <Mail size={14} className="mr-1" />
-                                {contact.email}
-                              </div>
+                        
+                      </div>
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap">
+                      <div className="text-sm font-medium text-gray-900 dark:text-white">
+                        {contact.name}
+                      </div>
+                    </td>
+                     <td className="px-6 py-4 whitespace-nowrap">
+                       <div className="flex items-center text-sm text-gray-900 dark:text-white">
+                         {contact.email ? (
+                           <>
+                             <Mail size={14} className="mr-2" />
+                             {contact.email}
+                           </>
+                         ) : (
+                           <span className="text-gray-400 dark:text-gray-500">-</span>
                             )}
-                            {contact.phone && (
-                              <div className="flex items-center">
-                                <Phone size={14} className="mr-1" />
-                                {contact.phone}
-                              </div>
-                            )}
                           </div>
-                        </div>
+                     </td>
+                     <td className="px-6 py-4 whitespace-nowrap">
+                       <div className="flex items-center text-sm text-gray-900 dark:text-white">
+                         {contact.phone ? (
+                           <>
+                             <Phone size={14} className="mr-2" />
+                             {contact.phone}
+                           </>
+                         ) : (
+                           <span className="text-gray-400 dark:text-gray-500">-</span>
+                         )}
                       </div>
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap">
@@ -479,84 +403,6 @@ const Contacts: React.FC = () => {
                         {formatDate(contact.createdAt)}
                       </div>
                     </td>
-                    <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
-                      <div className="flex items-center justify-end space-x-2">
-                                                 <button
-                           onClick={() => toggleExpanded(contact.id)}
-                           className="text-gray-600 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-300 transition-colors duration-200"
-                           title="View conversation"
-                         >
-                           <ChevronRight 
-                             size={16} 
-                             className={`transition-transform duration-500 ease-in-out ${
-                               expandedContacts.has(contact.id) ? 'rotate-90' : 'rotate-0'
-                             }`}
-                           />
-                         </button>
-                        <button
-                          onClick={() => handleEdit(contact)}
-                          className="text-blue-600 hover:text-blue-900 dark:text-blue-400 dark:hover:text-blue-300"
-                          title="Edit contact"
-                        >
-                          <Pencil size={16} />
-                        </button>
-                        <button
-                          onClick={() => handleDelete(contact.id)}
-                          className="text-red-600 hover:text-red-900 dark:text-red-400 dark:hover:text-red-300"
-                          title="Delete contact"
-                        >
-                          <Trash2 size={16} />
-                        </button>
-                      </div>
-                    </td>
-                  </tr>
-                                     {/* Expanded Conversation */}
-                   <tr className={`transition-all duration-500 ease-in-out ${
-                     expandedContacts.has(contact.id) 
-                       ? 'max-h-screen opacity-100' 
-                       : 'max-h-0 opacity-0 overflow-hidden'
-                   }`}>
-                     <td colSpan={5} className={`px-6 py-4 bg-gray-50 dark:bg-gray-700 transition-all duration-500 ease-in-out ${
-                       expandedContacts.has(contact.id) ? 'py-4' : 'py-0'
-                     }`}>
-                                                 {expandedContacts.has(contact.id) && (
-                           <div className="space-y-4">
-                             <div className="flex items-center space-x-2">
-                               <MessageCircle size={16} className="text-blue-600" />
-                               <h4 className="text-sm font-medium text-gray-900 dark:text-white">
-                                 Conversation History
-                               </h4>
-                             </div>
-                             <div className="space-y-3 max-h-64 overflow-y-auto">
-                               {contact.conversationContext.messages.map((message, index) => (
-                                 <div
-                                   key={index}
-                                   className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}
-                                 >
-                                   <div
-                                     className={`max-w-xs lg:max-w-md px-4 py-2 rounded-lg ${
-                                       message.role === 'user'
-                                         ? 'bg-blue-600 text-white'
-                                         : 'bg-gray-200 dark:bg-gray-600 text-gray-900 dark:text-white'
-                                     }`}
-                                   >
-                                     <div className="text-sm whitespace-pre-wrap">{message.content}</div>
-                                     <div className={`text-xs mt-1 ${
-                                       message.role === 'user' ? 'text-blue-100' : 'text-gray-500 dark:text-gray-400'
-                                     }`}>
-                                       {formatMessageTime(message.timestamp)}
-                                     </div>
-                                   </div>
-                                 </div>
-                               ))}
-                             </div>
-                             <div className="text-xs text-gray-500 dark:text-gray-400">
-                               <div><strong>Page:</strong> {contact.conversationContext.variables.page}</div>
-                               <div><strong>Referrer:</strong> {contact.conversationContext.variables.referrer}</div>
-                             </div>
-                           </div>
-                         )}
-                                               </td>
                       </tr>
                 </React.Fragment>
               ))}
@@ -571,101 +417,23 @@ const Contacts: React.FC = () => {
             <p className="text-gray-500 dark:text-gray-400">
               {searchTerm 
                 ? 'Try adjusting your search'
+                 : dataSource === 'sheets' 
+                   ? 'No leads found in Google Sheets. Add some data to your sheet to see leads here.'
                 : 'No chatbot leads have been received yet'
               }
             </p>
+                         {dataSource === 'sheets' && (
+                                <div className="mt-4 p-4 bg-blue-50 dark:bg-blue-900/20 rounded-lg">
+                   <p className="text-sm text-blue-700 dark:text-blue-300">
+                     <strong>Sheet Format:</strong> Columns A-G: Name, Email, Phone, Conversation (JSON), Source, Status, Timestamp
+                   </p>
+                 </div>
+             )}
           </div>
         )}
       </div>
 
-      {/* Modal */}
-      {isModalOpen && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
-          <div className="bg-white dark:bg-gray-800 rounded-lg max-w-md w-full max-h-[90vh] overflow-y-auto">
-            <div className="flex items-center justify-between p-6 border-b border-gray-200 dark:border-gray-700">
-              <h2 className="text-lg font-semibold text-gray-900 dark:text-white">
-                {editingContact ? 'Edit Contact' : 'Add New Contact'}
-              </h2>
-              <button
-                onClick={() => setIsModalOpen(false)}
-                className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300"
-              >
-                <X size={24} />
-              </button>
-            </div>
-            
-            <div className="p-6 space-y-4">
-              <div>
-                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-                  Name *
-                </label>
-                <input
-                  type="text"
-                  name="name"
-                  value={newContact.name}
-                  onChange={handleInputChange}
-                  className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent dark:bg-gray-700 dark:text-white"
-                  required
-                />
-              </div>
-              
-              <div>
-                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-                  Email
-                </label>
-                <input
-                  type="email"
-                  name="email"
-                  value={newContact.email}
-                  onChange={handleInputChange}
-                  className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent dark:bg-gray-700 dark:text-white"
-                />
-              </div>
-              
-              <div>
-                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-                  Phone
-                </label>
-                <input
-                  type="tel"
-                  name="phone"
-                  value={newContact.phone}
-                  onChange={handleInputChange}
-                  className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent dark:bg-gray-700 dark:text-white"
-                />
-              </div>
-              
-              <div>
-                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-                  Message
-                </label>
-                <textarea
-                  name="message"
-                  value={newContact.message}
-                  onChange={handleInputChange}
-                  rows={3}
-                  className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent dark:bg-gray-700 dark:text-white"
-                />
-              </div>
-            </div>
-            
-            <div className="flex items-center justify-end space-x-3 p-6 border-t border-gray-200 dark:border-gray-700">
-              <button
-                onClick={() => setIsModalOpen(false)}
-                className="px-4 py-2 text-gray-700 dark:text-gray-300 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={handleSave}
-                className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
-              >
-                {editingContact ? 'Update' : 'Save'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      
     </div>
   );
 };
