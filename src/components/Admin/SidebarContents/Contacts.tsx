@@ -40,7 +40,7 @@ interface Contact {
 const Contacts: React.FC = () => {
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [isLoading, setIsLoading] = useState(true);
-  const [filterStatus, setFilterStatus] = useState<string>('all');
+
   const [searchTerm, setSearchTerm] = useState<string>('');
   const [dataSource, setDataSource] = useState<'sheets' | 'api'>('api');
 
@@ -68,7 +68,72 @@ const Contacts: React.FC = () => {
       
       return rows.map((row: any[], index: number) => {
         // Handle different column arrangements - try to map columns intelligently
-        const [name, email, phone, conversationData, source, timestamp] = row;
+        // Ensure we have enough columns, pad with empty strings if needed
+        const paddedRow = [...row, '', '', '', '', '', ''];
+        
+        // Try to intelligently map columns based on content
+        let name = '', email = '', phone = '', conversationData = '', source = '', timestamp = '';
+        
+        // Look for email pattern
+        const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        // Look for phone pattern (basic)
+        const phonePattern = /^[\+]?[0-9\s\-\(\)]+$/;
+        // Look for ID pattern (just numbers)
+        const idPattern = /^\d+$/;
+        
+        // First pass: identify emails, phones, and timestamps
+        paddedRow.forEach((cell) => {
+          if (cell) {
+            const cellStr = String(cell).trim();
+            
+            // Check if it's an email
+            if (emailPattern.test(cellStr) && !email) {
+              email = cellStr;
+            }
+            // Check if it's a phone number
+            else if (phonePattern.test(cellStr) && cellStr.length >= 7 && !phone) {
+              phone = cellStr;
+            }
+            // Check if it's a date/timestamp
+            else if (new Date(cellStr).toString() !== 'Invalid Date' && !timestamp) {
+              timestamp = cellStr;
+            }
+          }
+        });
+        
+        // Second pass: identify names (skip IDs and already identified fields)
+        paddedRow.forEach((cell) => {
+          if (cell) {
+            const cellStr = String(cell).trim();
+            
+            // Skip if it's already identified as email, phone, or timestamp
+            if (cellStr === email || cellStr === phone || cellStr === timestamp) {
+              return;
+            }
+            
+            // Skip if it's just a number (likely an ID)
+            if (idPattern.test(cellStr)) {
+              return;
+            }
+            
+            // If it's not empty and looks like a name (contains letters, not just numbers)
+            if (cellStr.length > 0 && /[a-zA-Z]/.test(cellStr) && !name) {
+              name = cellStr;
+            }
+            // If we have a name but this looks like conversation data (longer text)
+            else if (name && cellStr.length > 20 && !conversationData) {
+              conversationData = cellStr;
+            }
+            // Otherwise, it might be source or other data
+            else if (!source && cellStr.length > 0) {
+              source = cellStr;
+            }
+          }
+        });
+        
+        // Debug: Log the original row data and mapped data
+        console.log(`Row ${index + 1} - Original:`, row);
+        console.log(`Row ${index + 1} - Mapped:`, { name, email, phone, conversationData, source, timestamp });
         
         // Parse timestamp if it exists
         let parsedTimestamp = new Date().toISOString();
@@ -138,11 +203,31 @@ const Contacts: React.FC = () => {
           ];
         }
         
-        return {
+        // If no name found, use the first non-empty cell that's not an ID
+        if (!name) {
+          for (let i = 0; i < paddedRow.length; i++) {
+            const cell = paddedRow[i];
+            if (cell && cell !== email && cell !== phone && cell !== timestamp) {
+              const cellStr = String(cell).trim();
+              if (cellStr.length > 0 && !idPattern.test(cellStr)) {
+                name = cellStr;
+                break;
+              }
+            }
+          }
+        }
+        
+        // If still no name, show the first few cells for debugging
+        if (!name) {
+          const firstFewCells = paddedRow.slice(0, 3).filter(cell => cell && String(cell).trim().length > 0);
+          name = firstFewCells.length > 0 ? `Data: ${firstFewCells.join(' | ')}` : 'No name found';
+        }
+        
+        const contact = {
           id: `sheet-${index + 1}`,
           chatbotId: `sheet-chatbot-${index + 1}`,
           userId: index + 1,
-          name: name || 'Unknown',
+          name: name || '',
           phone: phone || '',
           email: email || '',
           consentGiven: true, // Default to true for sheet data
@@ -157,7 +242,12 @@ const Contacts: React.FC = () => {
           createdAt: parsedTimestamp,
           updatedAt: parsedTimestamp
         };
-      }).filter((contact: Contact) => contact.name !== 'Unknown' || contact.email || contact.phone); // Filter out completely empty rows
+        
+        // Debug: Log the final contact object
+        console.log(`Contact ${index + 1}:`, contact);
+        
+        return contact;
+      }).filter((contact: Contact) => contact.name || contact.email || contact.phone); // Filter out completely empty rows
       
     } catch (error) {
       console.error('Error fetching from Google Sheets:', error);
@@ -234,11 +324,10 @@ const Contacts: React.FC = () => {
 
 
   const filteredContacts = contacts.filter(contact => {
-    const matchesStatus = filterStatus === 'all';
     const matchesSearch = contact.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
                          contact.email.toLowerCase().includes(searchTerm.toLowerCase()) ||
                          contact.phone.includes(searchTerm);
-    return matchesStatus && matchesSearch;
+    return matchesSearch;
   });
 
   if (isLoading) {
@@ -293,20 +382,7 @@ const Contacts: React.FC = () => {
               className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent dark:bg-gray-700 dark:text-white"
             />
           </div>
-          <div className="sm:w-48">
-            <select
-              value={filterStatus}
-              onChange={(e) => setFilterStatus(e.target.value)}
-              className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent dark:bg-gray-700 dark:text-white"
-            >
-              <option value="all">All Leads</option>
-              <option value="new">New</option>
-              <option value="contacted">Contacted</option>
-              <option value="qualified">Qualified</option>
-              <option value="converted">Converted</option>
-              <option value="lost">Lost</option>
-            </select>
-          </div>
+        
         </div>
       </div>
 
@@ -355,7 +431,7 @@ const Contacts: React.FC = () => {
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap">
                       <div className="text-sm font-medium text-gray-900 dark:text-white">
-                        {contact.name}
+                        {contact.name || ''}
                       </div>
                     </td>
                      <td className="px-6 py-4 whitespace-nowrap">
@@ -366,7 +442,7 @@ const Contacts: React.FC = () => {
                              {contact.email}
                            </>
                          ) : (
-                           <span className="text-gray-400 dark:text-gray-500">-</span>
+                           <span></span>
                             )}
                           </div>
                      </td>
@@ -378,7 +454,7 @@ const Contacts: React.FC = () => {
                              {contact.phone}
                            </>
                          ) : (
-                           <span className="text-gray-400 dark:text-gray-500">-</span>
+                           <span></span>
                          )}
                       </div>
                     </td>
